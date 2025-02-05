@@ -18,7 +18,8 @@ RUN rustup target add wasm32-unknown-unknown && \
 COPY . .
 
 # Build wasm component
-RUN cargo component build --release --target wasm32-unknown-unknown
+# RUN cargo component build --release --target wasm32-unknown-unknown
+RUN cargo component build --release --target wasm32-wasip1
 
 # Final stage - just the wasm file
 FROM scratch

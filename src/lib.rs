@@ -1,7 +1,8 @@
 #[allow(warnings)]
 mod bindings;
 
-use chrono::prelude::*;
+use chrono::NaiveDate;
+use chrono::NaiveDateTime;
 use csv::ReaderBuilder;
 use encoding_rs::WINDOWS_1252;
 use encoding_rs_io::DecodeReaderBytesBuilder;
@@ -107,8 +108,7 @@ impl SamFDW {
         match col_name {
             "posted_date" | "response_deadline" => {
                 if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-                    let utc_dt = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
-                    Some(Cell::Timestamp(utc_dt.timestamp()))
+                    Some(Cell::Timestamp(dt.and_utc().timestamp()))
                 } else {
                     None
                 }
@@ -117,8 +117,7 @@ impl SamFDW {
             "archive_date" | "award_date" => {
                 if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
                     let dt = date.and_hms_opt(0, 0, 0).unwrap();
-                    let ts = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
-                    Some(Cell::Timestamp(ts.timestamp()))
+                    Some(Cell::Timestamp(dt.and_utc().timestamp()))
                 } else {
                     None
                 }
@@ -172,7 +171,7 @@ impl Guest for SamFDW {
         Ok(())
     }
 
-    fn begin_scan(ctx: &Context) -> FdwResult {
+    fn begin_scan(_ctx: &Context) -> FdwResult {
         let this = Self::this_mut();
 
         // Only fetch data if we don't have it already
@@ -291,5 +290,4 @@ impl Guest for SamFDW {
     }
 }
 
-bindings::export!(SamFDW
- with_types_in bindings);
+bindings::export!(SamFDW with_types_in bindings);

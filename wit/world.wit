@@ -1,4 +1,4 @@
-package neely-innovations:sam-fdw@0.2.0;
+package neely-innovations:sam-fdw@0.2.2;
 
 world example {
     import supabase:wrappers/http@0.1.0;
