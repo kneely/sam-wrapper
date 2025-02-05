@@ -1,6 +1,11 @@
 #[allow(warnings)]
 mod bindings;
-use serde_json::Value as JsonValue;
+
+use std::io::Cursor;
+use chrono::prelude::*;
+use csv::ReaderBuilder;
+use encoding_rs::WINDOWS_1252;
+use encoding_rs_io::DecodeReaderBytesBuilder;
 
 use bindings::{
     exports::supabase::wrappers::routines::Guest,
@@ -11,17 +16,68 @@ use bindings::{
     },
 };
 
+const COLUMN_MAPPING: &[(&str, &str)] = &[
+    ("NoticeId", "notice_id"),
+    ("Title", "title"),
+    ("Sol#", "solicitation_number"),
+    ("Department/Ind.Agency", "agency"),
+    ("CGAC", "cgac"),
+    ("Sub-Tier", "sub_tier"),
+    ("FPDS Code", "fpds_code"),
+    ("Office", "office"),
+    ("AAC Code", "aac_code"),
+    ("PostedDate", "posted_date"),
+    ("Type", "type"),
+    ("BaseType", "base_type"),
+    ("ArchiveType", "archive_type"),
+    ("ArchiveDate", "archive_date"),
+    ("SetASideCode", "set_aside_code"),
+    ("SetASide", "set_aside"),
+    ("ResponseDeadLine", "response_deadline"),
+    ("NaicsCode", "naics_code"),
+    ("ClassificationCode", "classification_code"),
+    ("PopStreetAddress", "pop_street_address"),
+    ("PopCity", "pop_city"),
+    ("PopState", "pop_state"),
+    ("PopZip", "pop_zip"),
+    ("PopCountry", "pop_country"),
+    ("Active", "active"),
+    ("AwardNumber", "award_number"),
+    ("AwardDate", "award_date"),
+    ("Award$", "award_amount"),
+    ("Awardee", "awardee"),
+    ("PrimaryContactTitle", "primary_contact_title"),
+    ("PrimaryContactFullname", "primary_contact_fullname"),
+    ("PrimaryContactEmail", "primary_contact_email"),
+    ("PrimaryContactPhone", "primary_contact_phone"),
+    ("PrimaryContactFax", "primary_contact_fax"),
+    ("SecondaryContactTitle", "secondary_contact_title"),
+    ("SecondaryContactFullname", "secondary_contact_fullname"),
+    ("SecondaryContactEmail", "secondary_contact_email"),
+    ("SecondaryContactPhone", "secondary_contact_phone"),
+    ("SecondaryContactFax", "secondary_contact_fax"),
+    ("OrganizationType", "organization_type"),
+    ("State", "state"),
+    ("City", "city"),
+    ("ZipCode", "zip_code"),
+    ("CountryCode", "country_code"),
+    ("AdditionalInfoLink", "additional_info_link"),
+    ("Link", "link"),
+    ("Description", "description"),
+];
+
 #[derive(Debug, Default)]
-struct ExampleFdw {
+struct SamFDW {
     base_url: String,
-    src_rows: Vec<JsonValue>,
-    src_idx: usize,
+    csv_reader: Option<csv::Reader<Box<dyn std::io::Read>>>,
+    headers: Vec<String>,
+    response_body: Vec<u8>,  // Store response body for re-scanning
 }
 
 // pointer for the static FDW instance
-static mut INSTANCE: *mut ExampleFdw = std::ptr::null_mut::<ExampleFdw>();
+static mut INSTANCE: *mut SamFDW = std::ptr::null_mut::<SamFDW>();
 
-impl ExampleFdw {
+impl SamFDW {
     // initialise FDW instance
     fn init_instance() {
         let instance = Self::default();
@@ -33,9 +89,63 @@ impl ExampleFdw {
     fn this_mut() -> &'static mut Self {
         unsafe { &mut (*INSTANCE) }
     }
+
+    fn transform_value(col_name: &str, value: &str) -> Option<Cell> {
+        if value.trim().is_empty() || value.to_lowercase() == "nan" {
+            return None;
+        }
+
+        match col_name {
+            "posted_date" | "response_deadline" => {
+                if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
+                    let utc_dt = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+                    Some(Cell::Timestamp(utc_dt.timestamp()))
+                } else {
+                    None
+                }
+            }
+
+            "archive_date" | "award_date" => {
+                if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+                    let dt = date.and_hms_opt(0, 0, 0).unwrap();
+                    let ts = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+                    Some(Cell::Timestamp(ts.timestamp()))
+                } else {
+                    None
+                }
+            }
+
+            "award_amount" => {
+                let cleaned = value.replace(['$', ','], "");
+                cleaned.parse::<f64>().ok().map(|v| Cell::Numeric(v.to_string()))
+            }
+
+            "naics_code" | "cgac" => {
+                if let Ok(num) = value.parse::<f64>() {
+                    Some(Cell::String(num.trunc().to_string()))
+                } else {
+                    Some(Cell::String(value.to_string()))
+                }
+            }
+
+            "active" => match value.to_lowercase().as_str() {
+                "yes" => Some(Cell::Bool(true)),
+                "no" => Some(Cell::Bool(false)),
+                _ => None,
+            },
+
+            _ => Some(Cell::String(value.to_string())),
+        }
+    }
+
+    fn get_column_index(&self, target_col: &str) -> Option<usize> {
+        COLUMN_MAPPING.iter()
+            .find(|(_, tgt)| *tgt == target_col)
+            .and_then(|(src, _)| self.headers.iter().position(|h| h == src))
+    }
 }
 
-impl Guest for ExampleFdw {
+impl Guest for SamFDW {
     fn host_version_requirement() -> String {
         // semver expression for Wasm FDW host version requirement
         // ref: https://docs.rs/semver/latest/semver/enum.Op.html
@@ -47,7 +157,7 @@ impl Guest for ExampleFdw {
         let this = Self::this_mut();
 
         let opts = ctx.get_options(OptionsType::Server);
-        this.base_url = opts.require_or("api_url", "https://api.github.com");
+        this.base_url = opts.require_or("api_url", "https://falextracts.s3.amazonaws.com");
 
         Ok(())
     }
@@ -55,81 +165,89 @@ impl Guest for ExampleFdw {
     fn begin_scan(ctx: &Context) -> FdwResult {
         let this = Self::this_mut();
 
-        let opts = ctx.get_options(OptionsType::Table);
-        let object = opts.require("object")?;
-        let url = format!("{}/{}", this.base_url, object);
+        // Only fetch data if we don't have it already
+        if this.response_body.is_empty() {
+            let url = format!("{}/Contract%20Opportunities/datagov/ContractOpportunitiesFullCSV.csv", this.base_url);
+            let headers = vec![("user-agent".to_owned(), "SAM FDW".to_owned())];
+            let req = http::Request {
+                method: http::Method::Get,
+                url,
+                headers,
+                body: String::default(),
+            };
+            let resp = http::get(&req)?;
+            this.response_body = resp.body.into_bytes();
+        }
 
-        let headers: Vec<(String, String)> =
-            vec![("user-agent".to_owned(), "Example FDW".to_owned())];
+        // Create a new reader from the stored response
+        let cursor = Cursor::new(&this.response_body);
+        let transcoded = DecodeReaderBytesBuilder::new()
+            .encoding(Some(WINDOWS_1252))
+            .build(cursor);
 
-        let req = http::Request {
-            method: http::Method::Get,
-            url,
-            headers,
-            body: String::default(),
-        };
-        let resp = http::get(&req)?;
-        let resp_json: JsonValue = serde_json::from_str(&resp.body).map_err(|e| e.to_string())?;
+        let mut rdr = ReaderBuilder::new()
+            .flexible(true)
+            .from_reader(Box::new(transcoded));
 
-        this.src_rows = resp_json
-            .as_array()
-            .map(|v| v.to_owned())
-            .expect("response should be a JSON array");
+        // Get headers if we don't have them
+        if this.headers.is_empty() {
+            this.headers = rdr.headers()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        }
 
-        utils::report_info(&format!("We got response array length: {}", this.src_rows.len()));
-
+        this.csv_reader = Some(rdr);
         Ok(())
     }
 
     fn iter_scan(ctx: &Context, row: &Row) -> Result<Option<u32>, FdwError> {
         let this = Self::this_mut();
 
-        if this.src_idx >= this.src_rows.len() {
-            return Ok(None);
-        }
+        let reader = this.csv_reader.as_mut()
+            .ok_or("CSV reader not initialized")?;
 
-        let src_row = &this.src_rows[this.src_idx];
-        for tgt_col in ctx.get_columns() {
-            let tgt_col_name = tgt_col.name();
-            let src = src_row
-                .as_object()
-                .and_then(|v| v.get(&tgt_col_name))
-                .ok_or(format!("source column '{}' not found", tgt_col_name))?;
-            let cell = match tgt_col.type_oid() {
-                TypeOid::Bool => src.as_bool().map(Cell::Bool),
-                TypeOid::String => src.as_str().map(|v| Cell::String(v.to_owned())),
-                TypeOid::Timestamp => {
-                    if let Some(s) = src.as_str() {
-                        let ts = time::parse_from_rfc3339(s)?;
-                        Some(Cell::Timestamp(ts))
-                    } else {
-                        None
+        let mut record = csv::StringRecord::new();
+        match reader.read_record(&mut record) {
+            Ok(true) => {
+                // Skip rows without notice_id
+                if let Some(notice_id_idx) = this.get_column_index("notice_id") {
+                    if record.get(notice_id_idx).map_or(true, |v| v.trim().is_empty()) {
+                        return Ok(Some(0));
                     }
                 }
-                TypeOid::Json => src.as_object().map(|_| Cell::Json(src.to_string())),
-                _ => {
-                    return Err(format!(
-                        "column {} data type is not supported",
-                        tgt_col_name
-                    ));
+
+                for tgt_col in ctx.get_columns() {
+                    let tgt_col_name = tgt_col.name();
+                    
+                    if let Some(idx) = this.get_column_index(tgt_col_name) {
+                        if let Some(value) = record.get(idx) {
+                            let cell = Self::transform_value(tgt_col_name, value);
+                            row.push(cell.as_ref());
+                        } else {
+                            row.push(None);
+                        }
+                    } else {
+                        return Err(format!("Column mapping not found for '{}'", tgt_col_name));
+                    }
                 }
-            };
-
-            row.push(cell.as_ref());
+                Ok(Some(0))
+            },
+            Ok(false) => Ok(None),
+            Err(e) => Err(e.to_string()),
         }
-
-        this.src_idx += 1;
-
-        Ok(Some(0))
     }
 
-    fn re_scan(_ctx: &Context) -> FdwResult {
-        Err("re_scan on foreign table is not supported".to_owned())
+    fn re_scan(ctx: &Context) -> FdwResult {
+        // Re-initialize the CSV reader from stored response
+        Self::begin_scan(ctx)
     }
 
     fn end_scan(_ctx: &Context) -> FdwResult {
         let this = Self::this_mut();
-        this.src_rows.clear();
+        this.csv_reader = None;
+        // Don't clear headers or response_body as we might need them for re-scanning
         Ok(())
     }
 
@@ -154,4 +272,5 @@ impl Guest for ExampleFdw {
     }
 }
 
-bindings::export!(ExampleFdw with_types_in bindings);
+bindings::export!(SamFDW
+ with_types_in bindings);
