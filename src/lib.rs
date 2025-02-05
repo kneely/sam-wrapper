@@ -1,18 +1,17 @@
 #[allow(warnings)]
 mod bindings;
 
-use std::io::Cursor;
 use chrono::prelude::*;
 use csv::ReaderBuilder;
 use encoding_rs::WINDOWS_1252;
 use encoding_rs_io::DecodeReaderBytesBuilder;
+use std::io::Cursor;
 
 use bindings::{
     exports::supabase::wrappers::routines::Guest,
     supabase::wrappers::{
-        http, time,
-        types::{Cell, Context, FdwError, FdwResult, OptionsType, Row, TypeOid},
-        utils,
+        http,
+        types::{Cell, Context, FdwError, FdwResult, OptionsType, Row},
     },
 };
 
@@ -66,12 +65,22 @@ const COLUMN_MAPPING: &[(&str, &str)] = &[
     ("Description", "description"),
 ];
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct SamFDW {
     base_url: String,
-    csv_reader: Option<csv::Reader<Box<dyn std::io::Read>>>,
+    csv_reader: Option<csv::Reader<Box<dyn std::io::Read + Send>>>,
     headers: Vec<String>,
-    response_body: Vec<u8>,  // Store response body for re-scanning
+    response_body: Vec<u8>,
+}
+
+impl std::fmt::Debug for SamFDW {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SamFDW")
+            .field("base_url", &self.base_url)
+            .field("headers", &self.headers)
+            .field("response_body", &self.response_body)
+            .finish()
+    }
 }
 
 // pointer for the static FDW instance
@@ -117,7 +126,7 @@ impl SamFDW {
 
             "award_amount" => {
                 let cleaned = value.replace(['$', ','], "");
-                cleaned.parse::<f64>().ok().map(|v| Cell::Numeric(v.to_string()))
+                cleaned.parse::<f64>().ok().map(|v| Cell::Numeric(v))
             }
 
             "naics_code" | "cgac" => {
@@ -139,9 +148,10 @@ impl SamFDW {
     }
 
     fn get_column_index(&self, target_col: &str) -> Option<usize> {
-        COLUMN_MAPPING.iter()
+        COLUMN_MAPPING
+            .iter()
             .find(|(_, tgt)| *tgt == target_col)
-            .and_then(|(src, _)| self.headers.iter().position(|h| h == src))
+            .and_then(|(src, _)| self.headers.iter().position(|h| h.as_str() == *src))
     }
 }
 
@@ -167,7 +177,10 @@ impl Guest for SamFDW {
 
         // Only fetch data if we don't have it already
         if this.response_body.is_empty() {
-            let url = format!("{}/Contract%20Opportunities/datagov/ContractOpportunitiesFullCSV.csv", this.base_url);
+            let url = format!(
+                "{}/Contract%20Opportunities/datagov/ContractOpportunitiesFullCSV.csv",
+                this.base_url
+            );
             let headers = vec![("user-agent".to_owned(), "SAM FDW".to_owned())];
             let req = http::Request {
                 method: http::Method::Get,
@@ -187,11 +200,12 @@ impl Guest for SamFDW {
 
         let mut rdr = ReaderBuilder::new()
             .flexible(true)
-            .from_reader(Box::new(transcoded));
+            .from_reader(Box::new(transcoded) as Box<dyn std::io::Read + Send>);
 
         // Get headers if we don't have them
         if this.headers.is_empty() {
-            this.headers = rdr.headers()
+            this.headers = rdr
+                .headers()
                 .map_err(|e| e.to_string())?
                 .iter()
                 .map(|s| s.to_string())
@@ -205,7 +219,9 @@ impl Guest for SamFDW {
     fn iter_scan(ctx: &Context, row: &Row) -> Result<Option<u32>, FdwError> {
         let this = Self::this_mut();
 
-        let reader = this.csv_reader.as_mut()
+        let reader = this
+            .csv_reader
+            .as_mut()
             .ok_or("CSV reader not initialized")?;
 
         let mut record = csv::StringRecord::new();
@@ -213,17 +229,20 @@ impl Guest for SamFDW {
             Ok(true) => {
                 // Skip rows without notice_id
                 if let Some(notice_id_idx) = this.get_column_index("notice_id") {
-                    if record.get(notice_id_idx).map_or(true, |v| v.trim().is_empty()) {
+                    if record
+                        .get(notice_id_idx)
+                        .map_or(true, |v| v.trim().is_empty())
+                    {
                         return Ok(Some(0));
                     }
                 }
 
                 for tgt_col in ctx.get_columns() {
                     let tgt_col_name = tgt_col.name();
-                    
-                    if let Some(idx) = this.get_column_index(tgt_col_name) {
+
+                    if let Some(idx) = this.get_column_index(tgt_col_name.as_str()) {
                         if let Some(value) = record.get(idx) {
-                            let cell = Self::transform_value(tgt_col_name, value);
+                            let cell = Self::transform_value(tgt_col_name.as_str(), value);
                             row.push(cell.as_ref());
                         } else {
                             row.push(None);
@@ -233,7 +252,7 @@ impl Guest for SamFDW {
                     }
                 }
                 Ok(Some(0))
-            },
+            }
             Ok(false) => Ok(None),
             Err(e) => Err(e.to_string()),
         }

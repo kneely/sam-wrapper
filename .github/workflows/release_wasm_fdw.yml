@@ -1,10 +1,9 @@
 name: Release
 
-
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+' # Push events to matching wasm fdw tag, i.e. v1.0.2
+      - "v[0-9]+.[0-9]+.[0-9]+" # Push events to matching wasm fdw tag, i.e. v1.0.2
 
 permissions:
   contents: write
@@ -125,4 +124,3 @@ jobs:
             README.txt
             checksum.txt
             ./target/wasm32-unknown-unknown/release/*.wasm
-
